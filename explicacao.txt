@@ -1,0 +1,4 @@
+código roda em Arduino core
+
+prompt:
+Seguinte meu projeto é um aparelho que vai ligado a um purificador de agua para areas remotas. Ele vai pegar dados de hidrometro e vazão estimada l/dia (sensor yf s201)e vai dar aviso local (led + buzzer sobre o funcionamento) mas tambem vai enviar esses dados para uma dashboard(pagina web). A principio vai funcionar via wifi (a primeira vez a pessoa vai conectar na rede aberta do equipamento e depois vai ler o QR Code para entrar em um local e enviar os SSID da rede), se não conectar na rede vai logar na rede movel( mas ja vou preparar o sim 7600SA . Sou um pouco leigo nisso tudo, mas tenho uma base de arduino e esp32, de boas explicações e faça correções para se alinha ao meu proposito. Simples e funcional!

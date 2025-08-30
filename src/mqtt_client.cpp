@@ -1,0 +1,65 @@
+#include "mqtt_client.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Arduino.h>
+
+static WiFiClient espClient;
+static PubSubClient client(espClient);
+static char broker_buf[128] = "";
+static char mqtt_user[64] = "";
+static char mqtt_pass[64] = "";
+
+
+void mqtt_client_init(const char* broker, const char* user, const char* pass) {
+  if (!broker) return;
+  strncpy(broker_buf, broker, sizeof(broker_buf)-1);
+  if (user) strncpy(mqtt_user, user, sizeof(mqtt_user)-1);
+  if (pass) strncpy(mqtt_pass, pass, sizeof(mqtt_pass)-1);
+  client.setServer(broker, 1883);
+}
+
+bool mqtt_client_connected() {
+  if (client.connected()) return true;
+  if (strlen(broker_buf) == 0) return false;
+  // attempt reconnect
+  bool ok = false;
+  if (strlen(mqtt_user) && strlen(mqtt_pass)) {
+    ok = client.connect("pw_esp32", mqtt_user, mqtt_pass);
+  } else {
+    ok = client.connect("pw_esp32");
+  }
+  if (ok) Serial.println("MQTT connected");
+  return ok;
+}
+
+void mqtt_client_publish(const char* topic, const char* payload) {
+  if (!mqtt_client_connected()) return;
+  client.publish(topic, payload);
+}
+
+void mqtt_client_loop() {
+  if (client.connected()) client.loop();
+}
+
+// Build and publish telemetry JSON in the requested shape
+void mqtt_client_publish_telemetry(
+  const char* topic,
+  const char* device_id,
+  float lat,
+  float lon,
+  float flow_rate,
+  float total_liters,
+  const char* status)
+{
+  if (!topic || !device_id || !status) return;
+  if (!mqtt_client_connected()) return;
+
+  // Use a fixed-size buffer; adjust if you add more fields
+  // Ensure enough precision for GPS
+  char payload[256];
+  snprintf(payload, sizeof(payload),
+           "{\"device_id\":\"%s\",\"gps\":{\"lat\":%.6f,\"lon\":%.6f},\"flow_rate\":%.3f,\"total_liters\":%.3f,\"status\":\"%s\"}",
+             device_id, lat, lon, flow_rate, total_liters, status);
+
+  client.publish(topic, payload);
+}
