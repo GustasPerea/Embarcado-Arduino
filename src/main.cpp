@@ -1,5 +1,6 @@
 // Modular main.cpp que usa os módulos: flow_sensor, buzzer, hidrometer, sim7600, gps
 #include <Arduino.h>
+#include <time.h>
 #include "flow_sensor.h"
 #include "buzzer.h"
 #include "hidrometer.h"
@@ -28,10 +29,10 @@ const char* MQTT_USER   = "";             // ex.: "meuUsuario" (ou deixe vazio)
 const char* MQTT_PASS   = "";             // ex.: "minhaSenha" (ou deixe vazio)
 
 // Intervalos de envio (ajuste aqui)
-const uint32_t WIFI_PUBLISH_INTERVAL_MS     = 1000;  // Wi‑Fi/MQTT: 2s por padrão
+const uint32_t WIFI_PUBLISH_INTERVAL_MS     = 2000;  // Wi‑Fi/MQTT: 2s por padrão
 const uint32_t CELLULAR_PUBLISH_INTERVAL_MS = 30000; // Celular (SIM7600): 30s por padrão
-const uint32_t GPS_UPDATE_INTERVAL_MS       = 10000; // Atualiza GPS a cada 10s para não travar o loop
-const uint32_t SAVE_TOTAL_INTERVAL_MS       = 30000; // Salva total no flash a cada 30s para evitar desgaste
+const uint32_t GPS_UPDATE_INTERVAL_MS       = 20000; // Atualiza GPS a cada 10s para não travar o loop
+const uint32_t SAVE_TOTAL_INTERVAL_MS       = 60000; // Salva total no flash a cada 30s para evitar desgaste
 
 // Pins
 const int BUZZER_PIN       = 18; // PWM output
@@ -192,7 +193,8 @@ void monitorTask(void* pvParameters) {
         if (millis() - lastNtpAttemptMs > 5000) {
           lastNtpAttemptMs = millis();
           if (wifi_manager_connected()) {
-            configTzTime("-03", "pool.ntp.org", "time.google.com");
+            // POSIX TZ for Brazil UTC-3 (no DST). Use "<-03>3" to avoid DST rules.
+            configTzTime("<-03>3", "pool.ntp.org", "time.google.com");
           } else {
             // Tenta CNTP via SIM7600
             sim7600_sync_time_via_ntp();
@@ -314,6 +316,10 @@ void setup() {
   // Start Wi-Fi manager (tries STA connection, or starts SoftAP provisioning)
   build_device_id();
   wifi_manager_init();
+
+  // Garantir fuso horário correto (UTC-3, sem DST) desde o boot
+  setenv("TZ", "<-03>3", 1);
+  tzset();
 
   // Cria task principal como FreeRTOS task (pinned core 1)
   xTaskCreatePinnedToCore(

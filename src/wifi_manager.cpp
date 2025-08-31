@@ -8,6 +8,13 @@
 static WebServer* server = nullptr;
 static Preferences prefs;
 static const char* PREF_NS = "wifi";
+// Provisioning window control
+static bool provisioningActive = false;
+static uint32_t provisioningStartMs = 0;
+static bool wifiSavedThisSession = false;
+static bool wifiDisabledAfterTimeout = false;
+static const uint32_t PROVISIONING_WINDOW_MS = 120000; // 2 minutes
+static bool hadSavedCredentials = false;
 // Broker/usuário/senha MQTT agora são definidos diretamente no código (ver main.cpp)
 
 void handleRoot() {
@@ -25,6 +32,7 @@ void handleSave() {
   String pwd = server->arg("pwd");
   prefs.putString("ssid", ssid);
   prefs.putString("pwd", pwd);
+  wifiSavedThisSession = true;
   server->send(200, "text/html", "Saved. Rebooting...");
   delay(500);
   ESP.restart();
@@ -46,16 +54,47 @@ void wifi_manager_start_provisioning() {
   // ...existing code...
   server->begin();
   Serial.println("Provisioning AP started: PW_SETUP");
+  Serial.println("Portal ativo por 2 minutos para configurar o Wi‑Fi.");
+  provisioningActive = true;
+  provisioningStartMs = millis();
 }
 
 void wifi_manager_loop() {
   if (server) server->handleClient();
+
+  // Auto-shutdown AP if no Wi-Fi was saved within the provisioning window
+  if (provisioningActive && !wifiDisabledAfterTimeout) {
+    uint32_t now = millis();
+    if (!wifiSavedThisSession && (now - provisioningStartMs >= PROVISIONING_WINDOW_MS)) {
+      bool staConnected = (WiFi.getMode() & WIFI_MODE_STA) && (WiFi.status() == WL_CONNECTED);
+      if (staConnected) {
+        Serial.println("Provisioning window expired: disabling SoftAP; mantendo STA conectado");
+      } else {
+        Serial.println("Provisioning window expired: disabling SoftAP and Wi-Fi (cellular only)");
+      }
+      if (server) {
+        server->close();
+        delete server;
+        server = nullptr;
+      }
+      WiFi.softAPdisconnect(true);
+      if (!staConnected) {
+        WiFi.mode(WIFI_OFF); // keep only cellular path active
+      } else {
+        // Garante apenas STA ativo (sem AP)
+        WiFi.mode(WIFI_STA);
+      }
+      provisioningActive = false;
+      wifiDisabledAfterTimeout = true;
+    }
+  }
 }
 
 void wifi_manager_init() {
   prefs.begin(PREF_NS, false);
   String ssid = prefs.getString("ssid", "");
   String pwd = prefs.getString("pwd", "");
+  hadSavedCredentials = (ssid.length() != 0);
   // broker/usuario/senha MQTT não são mais configurados via painel
 
   // Sempre manter AP para acesso ao portal, além de STA quando possível
@@ -80,9 +119,11 @@ void wifi_manager_init() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("Connected to WiFi");
   // Sync time for proper timestamps
-  configTzTime("-03", "pool.ntp.org", "time.google.com");
+  // POSIX TZ for Brazil UTC-3 (no DST). Note: POSIX sign is inverted.
+  // "<-03>" is the display name; offset 3 means UTC-3.
+  configTzTime("<-03>3", "pool.ntp.org", "time.google.com");
   } else {
-    Serial.println("WiFi: STA connection failed; AP permanece ativo para portal");
+  Serial.println("WiFi: STA connection failed; AP permanece ativo para portal por 2 minutos");
   }
 }
 

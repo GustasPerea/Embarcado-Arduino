@@ -256,7 +256,7 @@ bool sim7600_sync_time_via_ntp(const char* ntp1, const char* ntp2) {
   sim7600_at(set1.c_str(), 1200, true);
   // Tenta update
   String upd = sim7600_at("AT+CNTP", 8000, true);
-  if (upd.indexOf("OK") < 0) return false;
+  if (upd.indexOf("OK") < 0) { Serial.println("SIM7600: CNTP falhou"); return false; }
   // Lê hora da rede
   String clk = sim7600_at("AT+CCLK?", 1200, true);
   int p = clk.indexOf("\"");
@@ -264,8 +264,37 @@ bool sim7600_sync_time_via_ntp(const char* ntp1, const char* ntp2) {
     int q = clk.indexOf("\"", p+1);
     if (q > p) {
       String ts = clk.substring(p+1, q); // "yy/MM/dd,HH:MM:SS±zz"
-      // Parse simples: converte para time_t aproximado (sem tz exata) — opcional
-      // Aqui apenas sinalizamos sucesso; a dashboard pode usar seu próprio ts
+      // Parse para time_t UTC
+      int yy = ts.substring(0,2).toInt();
+      int MM = ts.substring(3,5).toInt();
+      int dd = ts.substring(6,8).toInt();
+      int hh = ts.substring(9,11).toInt();
+      int mm = ts.substring(12,14).toInt();
+      int ss = ts.substring(15,17).toInt();
+      int tzSign = (ts.length() >= 19 && (ts[17] == '+' || ts[17] == '-')) ? (ts[17] == '-' ? -1 : 1) : 1;
+      int tzVal = (ts.length() >= 20) ? ts.substring(18).toInt() : 0; // pode ser horas (ex: 03) ou quartes (ex: 12=3h)
+      int tzHours = (abs(tzVal) > 12) ? (tzVal / 4) : tzVal; // heurística: >12 => unidades de 15 min
+      // Monta tm como horário local do modem
+  struct tm tml{};
+      tml.tm_year = 2000 + yy - 1900;
+      tml.tm_mon  = MM - 1;
+      tml.tm_mday = dd;
+      tml.tm_hour = hh;
+      tml.tm_min  = mm;
+      tml.tm_sec  = ss;
+  // Converte para epoch assumindo que tml é horário local do modem (antes do offset). Para obter UTC:
+  // Faz mktime em UTC forçando TZ=UTC temporariamente
+  char* oldtz = getenv("TZ");
+  setenv("TZ", "UTC0", 1); tzset();
+  time_t local = mktime(&tml);
+  if (oldtz) setenv("TZ", oldtz, 1); else unsetenv("TZ");
+  tzset();
+      // Ajusta para UTC real subtraindo o offset local
+      time_t utc = local - (tzSign * tzHours * 3600);
+      struct timeval tv; tv.tv_sec = utc; tv.tv_usec = 0;
+      settimeofday(&tv, nullptr);
+      Serial.printf("SIM7600: Hora atualizada via CNTP/CCLK -> %04d-%02d-%02d %02d:%02d:%02d (UTC)\n",
+                    tml.tm_year+1900, tml.tm_mon+1, tml.tm_mday, tml.tm_hour, tml.tm_min, tml.tm_sec);
       return true;
     }
   }
