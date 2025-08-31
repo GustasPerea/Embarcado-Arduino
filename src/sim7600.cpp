@@ -1,5 +1,7 @@
 #include "sim7600.h"
 #include <Arduino.h>
+#include <string>
+#include <cstring>
 
 // Allow passing APN, APN_USER, APN_PASS without quotes via build_flags
 #ifndef APN
@@ -144,6 +146,130 @@ void sim7600_send(const char* topic, const char* payload) {
   Serial.println("SIM7600: Payload enviado. Fechando conexão...");
   String cipclose = sim7600_at("AT+CIPCLOSE=0", 1000, true);
   Serial.print("SIM7600: Resposta CIPCLOSE: "); Serial.println(cipclose);
+}
+
+// --- MQTT over SIM7600 (simple QoS0 one-shot) ---
+static void mqtt_write_uint16(uint8_t* b, uint16_t v) { b[0] = (v >> 8) & 0xFF; b[1] = v & 0xFF; }
+static void mqtt_wr_str(std::string& out, const char* s) {
+  uint16_t n = s ? (uint16_t)strlen(s) : 0; uint8_t len[2]; mqtt_write_uint16(len, n);
+  out.append((char*)len, 2); if (n) out.append(s, n);
+}
+
+bool sim7600_mqtt_publish(
+  const char* broker,
+  unsigned short port,
+  const char* user,
+  const char* pass,
+  const char* clientId,
+  const char* topic,
+  const char* payload,
+  bool retained)
+{
+  if (!broker || !clientId || !topic || !payload) return false;
+  // Ensure network open
+  String att = sim7600_at("AT+CGATT=1", 3000, true);
+  if (att.indexOf("OK") < 0) return false;
+  String netopen = sim7600_at("AT+NETOPEN", 4000, true);
+  if (netopen.indexOf("OK") < 0 && netopen.indexOf("Network is already opened") < 0) return false;
+
+  // TCP open
+  char openCmd[128];
+  snprintf(openCmd, sizeof(openCmd), "AT+CIPOPEN=0,\"TCP\",\"%s\",%u", broker, (unsigned)port);
+  String cipopen = sim7600_at(openCmd, 5000, true);
+  if (cipopen.indexOf("OK") < 0) return false;
+
+  // Build MQTT CONNECT packet
+  std::string pkt;
+  pkt.reserve(256);
+  // Fixed header (type 1 << 4)
+  pkt.push_back((char)0x10);
+  // Variable header + payload
+  std::string vh;
+  // Protocol name "MQTT"
+  mqtt_wr_str(vh, "MQTT");
+  // Protocol level 4 (3.1.1)
+  vh.push_back((char)0x04);
+  // Connect flags
+  uint8_t flags = 0x02; // CleanSession
+  if (user && user[0]) flags |= 0x80; // username
+  if (pass && pass[0]) flags |= 0x40; // password
+  vh.push_back((char)flags);
+  // Keepalive 60s
+  vh.push_back((char)0x00); vh.push_back((char)0x3C);
+  // Payload: ClientID, [User], [Pass]
+  mqtt_wr_str(vh, clientId);
+  if (user && user[0]) mqtt_wr_str(vh, user);
+  if (pass && pass[0]) mqtt_wr_str(vh, pass);
+  // Remaining length (MQTT varint)
+  uint32_t rl = (uint32_t)vh.size();
+  do { uint8_t enc = rl % 128; rl /= 128; if (rl) enc |= 128; pkt.push_back((char)enc);} while (rl);
+  pkt += vh;
+
+  // Send CONNECT
+  char sendHdr[32]; snprintf(sendHdr, sizeof(sendHdr), "AT+CIPSEND=0,%u", (unsigned)pkt.size());
+  sim7600_at(sendHdr, 500, false);
+  // Write binary bytes to socket
+  for (size_t i=0;i<pkt.size();++i) Serial1.write((uint8_t)pkt[i]);
+  Serial1.flush();
+  delay(200);
+  // Read until CONNACK
+  String rx = sim7600_at("", 1200, true);
+  if (rx.indexOf("ERROR") >= 0) { sim7600_at("AT+CIPCLOSE=0", 800, true); return false; }
+
+  // Build PUBLISH QoS0
+  std::string pub;
+  pub.push_back((char)(0x30 | (retained ? 0x01 : 0x00))); // qos0, retained flag
+  std::string pl;
+  mqtt_wr_str(pl, topic);
+  // payload bytes
+  pl.append(payload);
+  // Remaining length varint
+  uint32_t rl2 = (uint32_t)pl.size();
+  do { uint8_t enc = rl2 % 128; rl2 /= 128; if (rl2) enc |= 128; pub.push_back((char)enc);} while (rl2);
+  pub += pl;
+
+  // Send PUBLISH
+  snprintf(sendHdr, sizeof(sendHdr), "AT+CIPSEND=0,%u", (unsigned)pub.size());
+  sim7600_at(sendHdr, 500, false);
+  for (size_t i=0;i<pub.size();++i) Serial1.write((uint8_t)pub[i]);
+  Serial1.flush();
+  delay(150);
+
+  // Disconnect and close
+  // MQTT DISCONNECT (type 0xE0, length 0)
+  const uint8_t disc[2] = {0xE0, 0x00};
+  sim7600_at("AT+CIPSEND=0,2", 300, false);
+  Serial1.write(disc, 2); Serial1.flush();
+  delay(120);
+  sim7600_at("AT+CIPCLOSE=0", 800, true);
+  return true;
+}
+
+bool sim7600_sync_time_via_ntp(const char* ntp1, const char* ntp2) {
+  // Abre rede se necessário
+  String att = sim7600_at("AT+CGATT=1", 3000, true);
+  if (att.indexOf("OK") < 0) return false;
+  String netopen = sim7600_at("AT+NETOPEN", 4000, true);
+  if (netopen.indexOf("OK") < 0 && netopen.indexOf("Network is already opened") < 0) return false;
+  // Configura servidores NTP
+  String set1 = String("AT+CNTP=\"") + (ntp1?ntp1:"pool.ntp.org") + "\",0";
+  sim7600_at(set1.c_str(), 1200, true);
+  // Tenta update
+  String upd = sim7600_at("AT+CNTP", 8000, true);
+  if (upd.indexOf("OK") < 0) return false;
+  // Lê hora da rede
+  String clk = sim7600_at("AT+CCLK?", 1200, true);
+  int p = clk.indexOf("\"");
+  if (p >= 0) {
+    int q = clk.indexOf("\"", p+1);
+    if (q > p) {
+      String ts = clk.substring(p+1, q); // "yy/MM/dd,HH:MM:SS±zz"
+      // Parse simples: converte para time_t aproximado (sem tz exata) — opcional
+      // Aqui apenas sinalizamos sucesso; a dashboard pode usar seu próprio ts
+      return true;
+    }
+  }
+  return false;
 }
 
 // --- GPS support ---

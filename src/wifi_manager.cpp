@@ -3,20 +3,19 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <Arduino.h>
-#include "qrcodegen.hpp"
+// ...existing code...
 
 static WebServer* server = nullptr;
 static Preferences prefs;
 static const char* PREF_NS = "wifi";
-static char broker_buf[128] = "";
-static char muser_buf[64] = "";
-static char mpass_buf[64] = "";
+// Broker/usuário/senha MQTT agora são definidos diretamente no código (ver main.cpp)
 
 void handleRoot() {
-  String page = "<html><body><h2>Configurar Wi‑Fi e MQTT</h2>";
-  page += "<p>Conecte-se ao AP PW_SETUP, acesse <a href='http://192.168.4.1'>http://192.168.4.1</a> e salve suas credenciais.</p>";
-  page += "<form method=POST action=save>SSID:<input name=ssid><br>Senha:<input name=pwd type=password><br>Broker MQTT:<input name=broker value='" + String(broker_buf) + "'><br>MQTT user:<input name=muser value='" + String(muser_buf) + "'><br>MQTT pass:<input name=mpass type=password value='" + String(mpass_buf) + "'><br><input type=submit value=Salvar></form>";
-  page += "<p><a href='/qr'>Ver QR (SVG)</a> com as configurações atuais</p>";
+  String page = "<html><body><h2>Configurar Wi‑Fi</h2>";
+  page += "<p>Conecte-se ao AP PW_SETUP, acesse <a href='http://192.168.4.1'>http://192.168.4.1</a> e salve suas credenciais de Wi‑Fi.</p>";
+  page += "<p>Observação: o servidor MQTT é definido no código (main.cpp). Este painel não altera o broker.</p>";
+  page += "<form method=POST action=save>SSID:<input name=ssid><br>Senha:<input name=pwd type=password><br><input type=submit value=Salvar></form>";
+  // ...existing code...
   page += "</body></html>";
   server->send(200, "text/html", page);
 }
@@ -24,37 +23,14 @@ void handleRoot() {
 void handleSave() {
   String ssid = server->arg("ssid");
   String pwd = server->arg("pwd");
-  String broker = server->arg("broker");
-  String muser = server->arg("muser");
-  String mpass = server->arg("mpass");
   prefs.putString("ssid", ssid);
   prefs.putString("pwd", pwd);
-  prefs.putString("broker", broker);
-  prefs.putString("muser", muser);
-  prefs.putString("mpass", mpass);
   server->send(200, "text/html", "Saved. Rebooting...");
   delay(500);
   ESP.restart();
 }
 
-void handleQR() {
-  String ssid = prefs.getString("ssid", "");
-  String pwd = prefs.getString("pwd", "");
-  String broker = prefs.getString("broker", "");
-  String muser = prefs.getString("muser", "");
-  String mpass = prefs.getString("mpass", "");
-  String json = "{\"ssid\":\"" + ssid + "\",\"pwd\":\"" + pwd + "\",\"broker\":\"" + broker + "\",\"muser\":\"" + muser + "\",\"mpass\":\"" + mpass + "\"}";
-  auto q = qrcodegen::QrCode::encodeText(json.c_str(), qrcodegen::QrCode::Ecc::QRECC_LOW);
-  int size = q.getSize();
-  String svg = "<svg xmlns='http://www.w3.org/2000/svg' shape-rendering='crispEdges' viewBox='0 0 " + String(size) + " " + String(size) + "'>";
-  for (int y=0;y<size;y++) {
-    for (int x=0;x<size;x++) {
-      if (q.getModule(x,y)) svg += "<rect x='" + String(x) + "' y='" + String(y) + "' width='1' height='1' fill='black'/>";
-    }
-  }
-  svg += "</svg>";
-  server->send(200, "image/svg+xml", svg);
-}
+// ...existing code...
 
 void wifi_manager_start_provisioning() {
   WiFi.mode(WIFI_AP);
@@ -67,7 +43,7 @@ void wifi_manager_start_provisioning() {
   server = new WebServer(80);
   server->on("/", handleRoot);
   server->on("/save", HTTP_POST, handleSave);
-  server->on("/qr", handleQR);
+  // ...existing code...
   server->begin();
   Serial.println("Provisioning AP started: PW_SETUP");
 }
@@ -80,12 +56,7 @@ void wifi_manager_init() {
   prefs.begin(PREF_NS, false);
   String ssid = prefs.getString("ssid", "");
   String pwd = prefs.getString("pwd", "");
-  String broker = prefs.getString("broker", "");
-  String muser = prefs.getString("muser", "");
-  String mpass = prefs.getString("mpass", "");
-  if (broker.length()) strncpy(broker_buf, broker.c_str(), sizeof(broker_buf)-1);
-  if (muser.length()) strncpy(muser_buf, muser.c_str(), sizeof(muser_buf)-1);
-  if (mpass.length()) strncpy(mpass_buf, mpass.c_str(), sizeof(mpass_buf)-1);
+  // broker/usuario/senha MQTT não são mais configurados via painel
 
   // Sempre manter AP para acesso ao portal, além de STA quando possível
   wifi_manager_start_provisioning(); // inicia AP e servidor
@@ -118,25 +89,11 @@ void wifi_manager_init() {
 bool wifi_manager_connected() {
   return WiFi.status() == WL_CONNECTED;
 }
-
-const char* wifi_manager_get_broker() {
-  return broker_buf;
-}
-
-const char* wifi_manager_get_mqtt_user() {
-  return muser_buf;
-}
-
-const char* wifi_manager_get_mqtt_pass() {
-  return mpass_buf;
-}
+// getters removidos
 
 void wifi_manager_clear_credentials() {
   prefs.putString("ssid", "");
   prefs.putString("pwd", "");
-  prefs.putString("broker", "");
-  prefs.putString("muser", "");
-  prefs.putString("mpass", "");
   Serial.println("Credentials cleared. Rebooting for provisioning...");
   delay(300);
   ESP.restart();

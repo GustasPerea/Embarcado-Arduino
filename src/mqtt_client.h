@@ -4,6 +4,7 @@
 void mqtt_client_init(const char* broker, const char* user=nullptr, const char* pass=nullptr);
 bool mqtt_client_connected();
 void mqtt_client_publish(const char* topic, const char* payload);
+void mqtt_client_publish(const char* topic, const char* payload, bool retained);
 void mqtt_client_loop();
 
 // Convenience: publish telemetry JSON

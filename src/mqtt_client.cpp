@@ -15,7 +15,19 @@ void mqtt_client_init(const char* broker, const char* user, const char* pass) {
   strncpy(broker_buf, broker, sizeof(broker_buf)-1);
   if (user) strncpy(mqtt_user, user, sizeof(mqtt_user)-1);
   if (pass) strncpy(mqtt_pass, pass, sizeof(mqtt_pass)-1);
-  client.setServer(broker, 1883);
+  // Support "host" or "host:port"
+  const char* colon = strchr(broker, ':');
+  uint16_t port = 1883;
+  char host[128] = {0};
+  if (colon) {
+    size_t hlen = (size_t)(colon - broker);
+    if (hlen >= sizeof(host)) hlen = sizeof(host)-1;
+    memcpy(host, broker, hlen);
+    port = (uint16_t)atoi(colon + 1);
+  } else {
+    strncpy(host, broker, sizeof(host)-1);
+  }
+  client.setServer(colon ? host : broker, port);
 }
 
 bool mqtt_client_connected() {
@@ -35,6 +47,11 @@ bool mqtt_client_connected() {
 void mqtt_client_publish(const char* topic, const char* payload) {
   if (!mqtt_client_connected()) return;
   client.publish(topic, payload);
+}
+
+void mqtt_client_publish(const char* topic, const char* payload, bool retained) {
+  if (!mqtt_client_connected()) return;
+  client.publish(topic, payload, retained);
 }
 
 void mqtt_client_loop() {

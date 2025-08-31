@@ -2,3 +2,41 @@ código roda em Arduino core
 
 prompt:
 Seguinte meu projeto é um aparelho que vai ligado a um purificador de agua para areas remotas. Ele vai pegar dados de hidrometro e vazão estimada l/dia (sensor yf s201)e vai dar aviso local (led + buzzer sobre o funcionamento) mas tambem vai enviar esses dados para uma dashboard(pagina web). A principio vai funcionar via wifi (a primeira vez a pessoa vai conectar na rede aberta do equipamento e depois vai ler o QR Code para entrar em um local e enviar os SSID da rede), se não conectar na rede vai logar na rede movel( mas ja vou preparar o sim 7600SA . Sou um pouco leigo nisso tudo, mas tenho uma base de arduino e esp32, de boas explicações e faça correções para se alinha ao meu proposito. Simples e funcional!
+
+---
+
+Como configurar o servidor MQTT (broker)
+
+1) Agora o broker é definido diretamente no código (sem painel):
+	- Arquivo: src/main.cpp
+	- Procure pelas constantes:
+		 const char* MQTT_BROKER = "192.168.0.10"; // altere para o IP/host do seu broker
+		 const char* MQTT_USER   = "";             // usuário opcional
+		 const char* MQTT_PASS   = "";             // senha opcional
+	- Porta usada: 1883 (ajustada dentro de src/mqtt_client.cpp)
+	- TLS/SSL: não habilitado neste projeto (usa MQTT sem TLS).
+
+2) Qual IP/host devo colocar?
+	- Broker no seu PC (ex.: Mosquitto): use o IP do seu computador na rede Wi‑Fi (ex.: 192.168.0.10).
+	  No Windows: abra o Prompt de Comando e rode "ipconfig"; pegue o IPv4 do adaptador Wi‑Fi.
+	- Broker em um servidor/Cloud: use o host fornecido (ex.: test.mosquitto.org, broker.hivemq.com, etc.).
+	- Recomendações: reservar um IP fixo no roteador para o PC/servidor, para não mudar com o tempo.
+
+3) Tem usuário/senha?
+	- Se seu broker exigir autenticação, preencha MQTT_USER e MQTT_PASS.
+	- Se não exigir, deixe ambos vazios ("").
+
+4) Como sei que conectou?
+	- O dispositivo tenta usar Wi‑Fi + MQTT quando conectado ao Wi‑Fi e quando MQTT_BROKER não está vazio.
+	- Se não tiver Wi‑Fi ou MQTT indisponível, ele envia via SIM7600 (fallback).
+
+5) Painel do ESP (AP PW_SETUP)
+	- O painel agora serve apenas para cadastrar SSID e Senha do Wi‑Fi.
+	- Como usar: conecte-se à rede aberta "PW_SETUP", abra http://192.168.4.1 e salve o Wi‑Fi.
+	- O broker NÃO é configurado no painel.
+
+6) Tópico de publicação
+	- Publica em: /sensor/hidrometro (veja src/main.cpp)
+	- Payload é uma string com timestamp, leituras e posição.
+
+Observação: QR Code foi removido do projeto (portal mais simples).

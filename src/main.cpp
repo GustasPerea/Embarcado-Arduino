@@ -11,8 +11,27 @@
 
 // ---------- Config (ajuste conforme necessário) ----------
 const char* DEVICE_NAME = "PW_EMBARCADO_ARDUINO";
-// Defina um broker padrão (pode ficar vazio). Portal pode sobrescrever.
-const char* MQTT_BROKER = ""; // ex.: "test.mosquitto.org". Vazio = usar apenas se portal fornecer
+// ID único do dispositivo para tópicos MQTT
+// Opção A) usar ID fixo: coloque USE_FIXED_DEVICE_ID=true e edite FIXED_DEVICE_ID (ex.: "device001")
+// Opção B) automático: gera "deviceXXXXXX" a partir do MAC do ESP32 (padrão)
+static const bool USE_FIXED_DEVICE_ID = true;
+static const char* FIXED_DEVICE_ID = "device001";
+static char DEVICE_ID[32] = {0};
+// MQTT: defina aqui o broker e (opcional) usuário/senha
+// Instruções:
+// - Para broker local (ex.: seu PC rodando Mosquitto), use o IP da sua rede, ex.: "192.168.0.10"
+// - Para um serviço público, use o host, ex.: "test.mosquitto.org"
+// - Porta padrão usada é 1883 (configurada em mqtt_client.cpp)
+// - Se o broker exigir autenticação, preencha MQTT_USER e MQTT_PASS. Caso contrário, deixe como "".
+const char* MQTT_BROKER = "192.168.0.106:1883"; // altere para o IP/host do seu broker
+const char* MQTT_USER   = "";             // ex.: "meuUsuario" (ou deixe vazio)
+const char* MQTT_PASS   = "";             // ex.: "minhaSenha" (ou deixe vazio)
+
+// Intervalos de envio (ajuste aqui)
+const uint32_t WIFI_PUBLISH_INTERVAL_MS     = 1000;  // Wi‑Fi/MQTT: 2s por padrão
+const uint32_t CELLULAR_PUBLISH_INTERVAL_MS = 30000; // Celular (SIM7600): 30s por padrão
+const uint32_t GPS_UPDATE_INTERVAL_MS       = 10000; // Atualiza GPS a cada 10s para não travar o loop
+const uint32_t SAVE_TOTAL_INTERVAL_MS       = 30000; // Salva total no flash a cada 30s para evitar desgaste
 
 // Pins
 const int BUZZER_PIN       = 18; // PWM output
@@ -21,7 +40,7 @@ const int LED_RED_GPIO     = 26;
 const int LED_GREEN_GPIO   = 27;
 const int LED_BLUE_GPIO    = 33;
 const int RESET_BUTTON_GPIO= 4;
-const int FLOW_SENSOR_PIN  = 25; // entrada do sensor de fluxo (pulsos) — igual ao PW_Embarcado
+const int FLOW_SENSOR_PIN  = 13; // entrada do sensor de fluxo (pulsos) — igual ao PW_Embarcado
 
 // SIM7600 pinout (module labels: G, R, T, K, V, G, S)
 // Map to ESP32 pins below. Adjust as needed for your board wiring.
@@ -46,6 +65,24 @@ static int64_t last_led_toggle = 0;
 static float totalLiters = 0.0f;
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 static bool mqttInitDone = false;
+static bool timeSynced = false;
+static uint32_t lastNtpAttemptMs = 0;
+static uint32_t lastCellularPublishMs = 0;
+static uint32_t lastGpsUpdateMs = 0;
+static uint32_t lastTotalSaveMs = 0;
+// constrói DEVICE_ID em setup
+static void build_device_id() {
+  if (USE_FIXED_DEVICE_ID && FIXED_DEVICE_ID && FIXED_DEVICE_ID[0] != '\0') {
+    strncpy(DEVICE_ID, FIXED_DEVICE_ID, sizeof(DEVICE_ID)-1);
+    return;
+  }
+  uint64_t mac = ESP.getEfuseMac();
+  // usa 3 bytes menos significativos do MAC
+  uint8_t b2 = (mac >> 16) & 0xFF;
+  uint8_t b1 = (mac >> 8) & 0xFF;
+  uint8_t b0 = (mac >> 0) & 0xFF;
+  snprintf(DEVICE_ID, sizeof(DEVICE_ID), "device%02X%02X%02X", b2, b1, b0);
+}
 
 
 // ---------- forward
@@ -92,6 +129,7 @@ void update_led(float flow_Lday) {
 void monitorTask(void* pvParameters) {
   (void) pvParameters;
   int64_t last_time = esp_timer_get_time();
+  uint32_t lastPublishMs = 0;
 
   while (true) {
     vTaskDelay(pdMS_TO_TICKS(1000)); // 1s loop
@@ -121,7 +159,11 @@ void monitorTask(void* pvParameters) {
 
     float increment = flow_sensor_get_increment(interval);
     totalLiters += increment;
-    hidrometer_save_total(totalLiters);
+    // Salva no flash apenas de tempos em tempos (reduz travas e desgaste)
+    if (millis() - lastTotalSaveMs >= SAVE_TOTAL_INTERVAL_MS) {
+      hidrometer_save_total(totalLiters);
+      lastTotalSaveMs = millis();
+    }
 
     float flow_Lmin = (increment / interval) * 60.0f;
     float flow_Lday = flow_Lmin * 60.0f * 24.0f;
@@ -134,37 +176,104 @@ void monitorTask(void* pvParameters) {
     localtime_r(&t, &tm);
 
     char gpsbuf[64];
-    gps_get_position(gpsbuf, sizeof(gpsbuf));
+    // Atualiza GPS apenas no intervalo configurado para evitar bloqueios longos (~6s)
+    static char lastGpsCached[64] = "0.000000,0.000000";
+    if (millis() - lastGpsUpdateMs >= GPS_UPDATE_INTERVAL_MS) {
+      gps_get_position(lastGpsCached, sizeof(lastGpsCached));
+      lastGpsUpdateMs = millis();
+    }
+    strncpy(gpsbuf, lastGpsCached, sizeof(gpsbuf)-1);
+    gpsbuf[sizeof(gpsbuf)-1] = '\0';
 
-    char payload[256];
-    snprintf(payload, sizeof(payload), "%s %04d-%02d-%02d %02d:%02d:%02d | Hidrometro: %.3f L | Vazao Estimada: %.2f L/dia | GPS: %s",
-             DEVICE_NAME,
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec,
-             totalLiters, flow_Lday, gpsbuf);
-
-    Serial.println(payload);
-    // Prefer WiFi+MQTT quando broker (portal ou default) definido, senão fallback SIM7600
-    const char* portalBroker = wifi_manager_get_broker();
-    const char* portalUser = wifi_manager_get_mqtt_user();
-    const char* portalPass = wifi_manager_get_mqtt_pass();
-
-    bool haveBroker = (portalBroker && portalBroker[0] != '\0') || (MQTT_BROKER[0] != '\0');
-    if (wifi_manager_connected() && haveBroker) {
-      if (!mqttInitDone) {
-        const char* useBroker = (portalBroker && portalBroker[0] != '\0') ? portalBroker : MQTT_BROKER;
-        const char* useUser = (portalUser && portalUser[0] != '\0') ? portalUser : nullptr;
-        const char* usePass = (portalPass && portalPass[0] != '\0') ? portalPass : nullptr;
-        mqtt_client_init(useBroker, useUser, usePass);
-        mqttInitDone = true;
-      }
-      if (mqtt_client_connected()) {
-        mqtt_client_publish("/sensor/hidrometro", payload);
+    // tenta sincronizar hora via NTP: primeiro por Wi‑Fi; se não, tenta via SIM7600
+    if (!timeSynced) {
+      time_t nowCheck = time(NULL);
+      if (nowCheck < 1609459200) { // 2021-01-01
+        if (millis() - lastNtpAttemptMs > 5000) {
+          lastNtpAttemptMs = millis();
+          if (wifi_manager_connected()) {
+            configTzTime("-03", "pool.ntp.org", "time.google.com");
+          } else {
+            // Tenta CNTP via SIM7600
+            sim7600_sync_time_via_ntp();
+          }
+        }
       } else {
-        sim7600_send("/sensor/hidrometro", payload);
+        timeSynced = true;
       }
-    } else {
-      sim7600_send("/sensor/hidrometro", payload);
+    }
+
+    // publica e imprime a cada 2s
+  if (millis() - lastPublishMs >= WIFI_PUBLISH_INTERVAL_MS) {
+      lastPublishMs = millis();
+      // JSON compacto: chaves curtas para economizar dados
+      // {"id":"dev001","ts":"2025-08-31 12:34:56","l":10.362,"f":1234.56,"g":"-23.5,-46.6"}
+      char payload[192];
+      snprintf(payload, sizeof(payload),
+        "{\"id\":\"%s\",\"ts\":\"%04d-%02d-%02d %02d:%02d:%02d\",\"l\":%.3f,\"f\":%.2f,\"g\":\"%s\"}",
+        DEVICE_ID,
+        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+        tm.tm_hour, tm.tm_min, tm.tm_sec,
+        totalLiters, flow_Lday, gpsbuf);
+
+      Serial.println(payload);
+  // Tópicos por dispositivo
+      String topicHid = String(DEVICE_ID) + "/sensor/hidrometro";
+      String topicGps = String(DEVICE_ID) + "/coordenadas/gps";
+
+      // Prefer WiFi+MQTT quando broker definido aqui; senão fallback SIM7600
+      if (wifi_manager_connected() && MQTT_BROKER[0] != '\0') {
+        if (!mqttInitDone) {
+          const char* useUser = (MQTT_USER[0] != '\0') ? MQTT_USER : nullptr;
+          const char* usePass = (MQTT_PASS[0] != '\0') ? MQTT_PASS : nullptr;
+          mqtt_client_init(MQTT_BROKER, useUser, usePass);
+          mqttInitDone = true;
+        }
+        if (mqtt_client_connected()) {
+          // mensagem principal retained (estado atual), GPS só quando mudar
+          static char lastGps[64] = "";
+          mqtt_client_publish(topicHid.c_str(), payload, true);
+          if (strcmp(lastGps, gpsbuf) != 0) {
+            mqtt_client_publish(topicGps.c_str(), gpsbuf);
+            strncpy(lastGps, gpsbuf, sizeof(lastGps)-1);
+          }
+        } else {
+          // Fallback celular mesmo com Wi‑Fi: respeita intervalo
+          uint32_t nowMs = millis();
+          if (nowMs - lastCellularPublishMs >= CELLULAR_PUBLISH_INTERVAL_MS) {
+            lastCellularPublishMs = nowMs;
+            sim7600_send(topicHid.c_str(), payload);
+            // via celular, economiza: só envia GPS quando mudar
+            static char lastGpsCell[64] = "";
+            if (strcmp(lastGpsCell, gpsbuf) != 0) {
+              sim7600_send(topicGps.c_str(), gpsbuf);
+              strncpy(lastGpsCell, gpsbuf, sizeof(lastGpsCell)-1);
+            }
+          }
+        }
+      } else {
+        // Sem Wi‑Fi: envia via celular como MQTT real no intervalo configurado
+        uint32_t nowMs = millis();
+        if (nowMs - lastCellularPublishMs >= CELLULAR_PUBLISH_INTERVAL_MS) {
+          lastCellularPublishMs = nowMs;
+          // Parse host:port se fornecido
+          const char* brokerStr = MQTT_BROKER;
+          const char* colon = strchr(brokerStr, ':');
+          unsigned short port = 1883; char host[96] = {0};
+          if (colon) {
+            size_t hlen = (size_t)(colon - brokerStr); if (hlen >= sizeof(host)) hlen = sizeof(host)-1;
+            memcpy(host, brokerStr, hlen); port = (uint16_t)atoi(colon+1);
+          } else {
+            strncpy(host, brokerStr, sizeof(host)-1);
+          }
+          sim7600_mqtt_publish(colon?host:brokerStr, port, (MQTT_USER[0]?MQTT_USER:nullptr), (MQTT_PASS[0]?MQTT_PASS:nullptr), DEVICE_ID, topicHid.c_str(), payload, true);
+          static char lastGpsNoWifi[64] = "";
+          if (strcmp(lastGpsNoWifi, gpsbuf) != 0) {
+            sim7600_mqtt_publish(colon?host:brokerStr, port, (MQTT_USER[0]?MQTT_USER:nullptr), (MQTT_PASS[0]?MQTT_PASS:nullptr), DEVICE_ID, topicGps.c_str(), gpsbuf, false);
+            strncpy(lastGpsNoWifi, gpsbuf, sizeof(lastGpsNoWifi)-1);
+          }
+        }
+      }
     }
   }
 }
@@ -203,6 +312,7 @@ void setup() {
   // Importante: ligar o GPS somente após Serial1 estar configurada pelo sim7600_init()
   gps_init();
   // Start Wi-Fi manager (tries STA connection, or starts SoftAP provisioning)
+  build_device_id();
   wifi_manager_init();
 
   // Cria task principal como FreeRTOS task (pinned core 1)

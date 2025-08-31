@@ -1,7 +1,9 @@
 #ifndef SIM7600_H
 #define SIM7600_H
 
+#include <Arduino.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // Configure UART and control pins. All params optional; pass -1 to skip.
 // rx_pin: ESP32 RX (connect to module T)
@@ -24,6 +26,20 @@ bool sim7600_is_on();
 
 // placeholder: send payload to broker via SIM7600
 void sim7600_send(const char* topic, const char* payload);
+
+// MQTT over SIM7600 (TCP socket): open, CONNECT, PUBLISH QoS0, DISCONNECT, close
+bool sim7600_mqtt_publish(
+	const char* broker,
+	unsigned short port,
+	const char* user,
+	const char* pass,
+	const char* clientId,
+	const char* topic,
+	const char* payload,
+	bool retained = false);
+
+// Sync ESP32 time via mobile network using SIM7600 +CNTP
+bool sim7600_sync_time_via_ntp(const char* ntp1 = "pool.ntp.org", const char* ntp2 = "time.google.com");
 
 // --- GPS helpers (SIM7600) ---
 // Liga o GPS (modo autônomo) usando AT+CGPS=1,1

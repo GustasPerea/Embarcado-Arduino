@@ -1,0 +1,53 @@
+Guia de envio via SIM7600SA
+
+Resumo
+- O dispositivo publica a cada ~2s via Wi‑Fi/MQTT (broker definido no código).
+- Quando Wi‑Fi/MQTT não está disponível, faz fallback para a rede móvel usando o módulo SIM7600SA.
+- Para economizar dados, o envio por rede móvel é limitado por um intervalo configurável.
+
+Onde configuro o IP/host do broker
+- Arquivo: src/main.cpp
+- Constantes:
+  MQTT_BROKER -> IP/host do seu broker (porta padrão 1883)
+  MQTT_USER / MQTT_PASS -> usuário/senha (opcional)
+
+Onde ajusto a quantidade de envios por rede móvel
+- Arquivo: src/main.cpp
+- Constante: CELLULAR_PUBLISH_INTERVAL_MS
+  Ex.: 30000 significa 30 segundos entre envios via celular.
+  Afeta tanto quando não há Wi‑Fi quanto quando o Wi‑Fi falha e cai no fallback.
+
+Lógica de envio (simplificada)
+1) Leitura e cálculo a cada segundo (fluxo, litros, GPS).
+2) A cada 2s:
+   - Monta payload JSON compacto: {"id":"<device>","ts":"<datahora>","l":<litros>,"f":<l_dia>,"g":"lat,lon"}
+   - Define tópicos por dispositivo:
+       {deviceId}/sensor/hidrometro  (retained)
+       {deviceId}/coordenadas/gps    (enviado somente quando GPS muda)
+3) Envio prioritário por Wi‑Fi/MQTT:
+   - Se Wi‑Fi conectado e MQTT_BROKER preenchido, publica via MQTT (QoS 0, retained apenas no hidrometro).
+4) Fallback celular (SIM7600):
+   - Se Wi‑Fi indisponível (ou MQTT desconectado), envia via SIM7600 somente se
+     já passou CELLULAR_PUBLISH_INTERVAL_MS desde o último envio celular.
+   - GPS por celular só é enviado quando mudar para poupar dados.
+
+Observações importantes
+- Envio celular agora publica MQTT de verdade (CONNECT/PUBLISH QoS0) via SIM7600, no mesmo formato dos tópicos do Wi‑Fi.
+- NTP: a hora pode ser sincronizada também via rede móvel (AT+CNTP) quando não houver Wi‑Fi.
+- deviceId: é automático a partir do MAC ("deviceXXXXXX") ou fixo (configurável no topo do src/main.cpp).
+
+Como reduzir ainda mais consumo
+- Aumente CELLULAR_PUBLISH_INTERVAL_MS (ex.: 60000 = 60s).
+- Reduza casas decimais em l (litros), f (vazão) e GPS.
+- Remova o campo ts (a dashboard pode usar o timestamp de recebimento).
+- Envie somente quando houver variação relevante (thresholds).
+
+Pontos do código relacionados
+- src/main.cpp
+  - MQTT_BROKER, MQTT_USER, MQTT_PASS (config do broker)
+  - CELLULAR_PUBLISH_INTERVAL_MS (intervalo celular)
+  - Envio MQTT vs SIM7600 e decisão de intervalo
+- src/mqtt_client.cpp/.h
+  - Publicação MQTT via Wi‑Fi
+- src/sim7600.cpp/.h
+  - Envio via rede móvel (AT+NETOPEN, AT+CIPOPEN, AT+CIPSEND)
