@@ -15,7 +15,7 @@ void mqtt_client_init(const char* broker, const char* user, const char* pass) {
   strncpy(broker_buf, broker, sizeof(broker_buf)-1);
   if (user) strncpy(mqtt_user, user, sizeof(mqtt_user)-1);
   if (pass) strncpy(mqtt_pass, pass, sizeof(mqtt_pass)-1);
-  // Support "host" or "host:port"
+  // Support "host" or "host:port"; trim and handle IP literals to bypass DNS
   const char* colon = strchr(broker, ':');
   uint16_t port = 1883;
   char host[128] = {0};
@@ -23,11 +23,26 @@ void mqtt_client_init(const char* broker, const char* user, const char* pass) {
     size_t hlen = (size_t)(colon - broker);
     if (hlen >= sizeof(host)) hlen = sizeof(host)-1;
     memcpy(host, broker, hlen);
+    host[hlen] = '\0';
     port = (uint16_t)atoi(colon + 1);
   } else {
     strncpy(host, broker, sizeof(host)-1);
   }
-  client.setServer(colon ? host : broker, port);
+  // Trim leading/trailing whitespace/control chars
+  auto trim = [](char* s){
+    size_t len = strlen(s);
+    size_t i = 0; while (i < len && (unsigned char)s[i] <= 0x20) i++;
+    if (i > 0) memmove(s, s + i, len - i + 1);
+    len = strlen(s);
+    while (len && (unsigned char)s[len-1] <= 0x20) { s[len-1] = '\0'; len--; }
+  };
+  trim(host);
+  IPAddress ip;
+  if (ip.fromString(host)) {
+    client.setServer(ip, port);
+  } else {
+    client.setServer(host, port);
+  }
 }
 
 bool mqtt_client_connected() {

@@ -15,6 +15,8 @@ static bool wifiSavedThisSession = false;
 static bool wifiDisabledAfterTimeout = false;
 static const uint32_t PROVISIONING_WINDOW_MS = 120000; // 2 minutes
 static bool hadSavedCredentials = false;
+static uint32_t lastReconnectAttemptMs = 0;
+static const uint32_t WIFI_RECONNECT_INTERVAL_MS = 600000; // 10 minutes
 // Broker/usuário/senha MQTT agora são definidos diretamente no código (ver main.cpp)
 
 void handleRoot() {
@@ -86,6 +88,43 @@ void wifi_manager_loop() {
       }
       provisioningActive = false;
       wifiDisabledAfterTimeout = true;
+    }
+  }
+
+  // Periodic reconnect attempts: if we have saved credentials and we're not connected,
+  // try to reconnect every WIFI_RECONNECT_INTERVAL_MS. This also handles the case
+  // where the AP was disabled after the provisioning window.
+  if (!wifi_manager_connected() && hadSavedCredentials) {
+    uint32_t now = millis();
+    if ((now - lastReconnectAttemptMs) >= WIFI_RECONNECT_INTERVAL_MS) {
+      lastReconnectAttemptMs = now;
+      String ssid = prefs.getString("ssid", "");
+      String pwd = prefs.getString("pwd", "");
+      if (ssid.length() > 0) {
+        Serial.printf("WiFi: tentativa de reconectar ao SSID salvo '%s'...\n", ssid.c_str());
+        // If WiFi was turned OFF after provisioning timeout, enable STA mode
+        if ((WiFi.getMode() & WIFI_MODE_STA) == 0) {
+          WiFi.mode(WIFI_STA);
+          WiFi.persistent(false);
+          WiFi.setSleep(false);
+        }
+        WiFi.begin(ssid.c_str(), pwd.c_str());
+        // Wait a short period for connection (non-blocking long)
+        uint32_t start = millis();
+        int tries = 0;
+        while (millis() - start < 8000) {
+          if (WiFi.status() == WL_CONNECTED) break;
+          delay(200);
+          if (++tries % 10 == 0) Serial.print('.');
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+          Serial.println("\nWiFi: reconectado com sucesso");
+          // Re-enable AP only if provisioningActive (shouldn't be) — keep AP down
+          wifiDisabledAfterTimeout = false; // keep state consistent
+        } else {
+          Serial.println("\nWiFi: falha ao reconectar (será tentado novamente em 10 min)");
+        }
+      }
     }
   }
 }

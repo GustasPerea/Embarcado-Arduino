@@ -16,7 +16,7 @@ const char* DEVICE_NAME = "PW_EMBARCADO_ARDUINO";
 // Opção A) usar ID fixo: coloque USE_FIXED_DEVICE_ID=true e edite FIXED_DEVICE_ID (ex.: "device001")
 // Opção B) automático: gera "deviceXXXXXX" a partir do MAC do ESP32 (padrão)
 static const bool USE_FIXED_DEVICE_ID = true;
-static const char* FIXED_DEVICE_ID = "device001";
+static const char* FIXED_DEVICE_ID = "0001PA-000";
 static char DEVICE_ID[32] = {0};
 // MQTT: defina aqui o broker e (opcional) usuário/senha
 // Instruções:
@@ -24,7 +24,7 @@ static char DEVICE_ID[32] = {0};
 // - Para um serviço público, use o host, ex.: "test.mosquitto.org"
 // - Porta padrão usada é 1883 (configurada em mqtt_client.cpp)
 // - Se o broker exigir autenticação, preencha MQTT_USER e MQTT_PASS. Caso contrário, deixe como "".
-const char* MQTT_BROKER = "192.168.0.106:1883"; // altere para o IP/host do seu broker
+const char* MQTT_BROKER = "192.168.47.64:1883"; // altere para o IP/host do seu broker
 const char* MQTT_USER   = "";             // ex.: "meuUsuario" (ou deixe vazio)
 const char* MQTT_PASS   = "";             // ex.: "minhaSenha" (ou deixe vazio)
 
@@ -41,7 +41,7 @@ const int LED_RED_GPIO     = 26;
 const int LED_GREEN_GPIO   = 27;
 const int LED_BLUE_GPIO    = 33;
 const int RESET_BUTTON_GPIO= 4;
-const int FLOW_SENSOR_PIN  = 13; // entrada do sensor de fluxo (pulsos) — igual ao PW_Embarcado
+const int FLOW_SENSOR_PIN  = 25; // entrada do sensor de fluxo (pulsos) — igual ao PW_Embarcado
 
 // SIM7600 pinout (module labels: G, R, T, K, V, G, S)
 // Map to ESP32 pins below. Adjust as needed for your board wiring.
