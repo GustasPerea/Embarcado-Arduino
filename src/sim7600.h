@@ -41,6 +41,40 @@ bool sim7600_mqtt_publish(
 // Sync ESP32 time via mobile network using SIM7600 +CNTP
 bool sim7600_sync_time_via_ntp(const char* ntp1 = "pool.ntp.org", const char* ntp2 = "time.google.com");
 
+// --- MQTT persistent session via AT+CMQTT ---
+// Starts the modem-managed MQTT stack and connects to broker, keeping the session alive.
+// - host: broker hostname or IP
+// - port: typically 1883 (non-TLS) or 8883 (TLS)
+// - clientId: unique client id
+// - user/pass: optional (nullptr or empty to omit)
+// - keepalive_sec: MQTT keepalive interval, default 60
+// - use_tls: enable TLS/SSL connection (for AWS IoT)
+// Returns true on connected.
+bool sim7600_mqtt_session_begin(
+	const char* host,
+	unsigned short port,
+	const char* clientId,
+	const char* user = nullptr,
+	const char* pass = nullptr,
+	uint16_t keepalive_sec = 60,
+	bool use_tls = false);
+
+// --- TLS/SSL Certificate management ---
+// Configure TLS certificates for secure MQTT connections
+bool sim7600_tls_configure_certs(const char* ca_cert, const char* client_cert, const char* private_key);
+
+// Clear TLS certificates
+bool sim7600_tls_clear_certs();
+
+// Publishes using the persistent session (QoS0). Returns true if accepted.
+bool sim7600_mqtt_session_publish(const char* topic, const char* payload, bool retained = false);
+
+// Returns true if the persistent session is up.
+bool sim7600_mqtt_session_connected();
+
+// Disconnects and stops the MQTT stack.
+void sim7600_mqtt_session_end();
+
 // --- GPS helpers (SIM7600) ---
 // Liga o GPS (modo autônomo) usando AT+CGPS=1,1
 bool sim7600_gps_on();

@@ -1,7 +1,8 @@
 #ifndef MQTT_CLIENT_H
 #define MQTT_CLIENT_H
 
-void mqtt_client_init(const char* broker, const char* user=nullptr, const char* pass=nullptr);
+// For AWS IoT, pass broker as endpoint (no port needed if you use default 8883) and provide clientId.
+void mqtt_client_init(const char* broker, const char* clientId=nullptr, const char* user=nullptr, const char* pass=nullptr);
 bool mqtt_client_connected();
 void mqtt_client_publish(const char* topic, const char* payload);
 void mqtt_client_publish(const char* topic, const char* payload, bool retained);

@@ -15,6 +15,7 @@ static int PIN_TX = 17; // ESP32 TX (connect to module R)
 static int PIN_PWRKEY = -1; // ESP32 to module K
 static int PIN_STATUS = -1; // ESP32 from module S
 static bool s_verbose = true;
+static bool s_mqtt_connected = false; // AT+CMQTT session state
 
 void sim7600_set_verbose(bool enabled) { s_verbose = enabled; }
 
@@ -166,7 +167,11 @@ bool sim7600_mqtt_publish(
   bool retained)
 {
   if (!broker || !clientId || !topic || !payload) return false;
+  Serial.printf("SIM7600: MQTT publish to %s:%u topic=%s len=%u\n", broker, (unsigned)port, topic, (unsigned)strlen(payload));
   // Ensure network open
+  // Quick network status
+  sim7600_at("AT+CREG?", 1500, true);
+  sim7600_at("AT+CSQ", 1500, true);
   String att = sim7600_at("AT+CGATT=1", 3000, true);
   if (att.indexOf("OK") < 0) return false;
   String netopen = sim7600_at("AT+NETOPEN", 4000, true);
@@ -176,7 +181,25 @@ bool sim7600_mqtt_publish(
   char openCmd[128];
   snprintf(openCmd, sizeof(openCmd), "AT+CIPOPEN=0,\"TCP\",\"%s\",%u", broker, (unsigned)port);
   String cipopen = sim7600_at(openCmd, 5000, true);
-  if (cipopen.indexOf("OK") < 0) return false;
+  // After OK, wait for URC +CIPOPEN: 0,0 (success) or error codes
+  String urc = sim7600_at("", 5000, false);
+  if (cipopen.indexOf("OK") < 0) {
+    Serial.println("SIM7600: CIPOPEN did not return OK");
+    return false;
+  }
+  if (urc.indexOf("+CIPOPEN:") >= 0) {
+    // Look for status code
+    int p = urc.indexOf("+CIPOPEN:");
+    int comma = urc.indexOf(',', p);
+    int end = (comma >= 0) ? urc.indexOf('\n', comma) : -1;
+    if (comma >= 0) {
+      int code = urc.substring(comma+1, (end>comma?end:urc.length())).toInt();
+      if (code != 0) {
+        Serial.printf("SIM7600: CIPOPEN URC error code=%d (TCP open failed)\n", code);
+        return false;
+      }
+    }
+  }
 
   // Build MQTT CONNECT packet
   std::string pkt;
@@ -243,6 +266,140 @@ bool sim7600_mqtt_publish(
   delay(120);
   sim7600_at("AT+CIPCLOSE=0", 800, true);
   return true;
+}
+
+// --- MQTT persistent session via AT+CMQTT ---
+static bool cmqtt_send(const char* cmd, uint32_t to_ms, bool requireOk = true) {
+  String r = sim7600_at(cmd, to_ms, requireOk);
+  if (!requireOk) return true;
+  if (r.indexOf("OK") >= 0) return true;
+  if (r.indexOf("ALREADY") >= 0 || r.indexOf("already") >= 0) return true;
+  return false;
+}
+
+bool sim7600_mqtt_session_begin(
+    const char* host,
+    unsigned short port,
+    const char* clientId,
+    const char* user,
+    const char* pass,
+    uint16_t keepalive_sec,
+    bool use_tls) {
+  if (!host || !clientId) return false;
+  
+  Serial.printf("SIM7600: Starting MQTT session to %s:%u (TLS: %s)\n", 
+                host, (unsigned)port, use_tls ? "enabled" : "disabled");
+  
+  // Ensure packet data
+  String att = sim7600_at("AT+CGATT=1", 3000, true);
+  if (att.indexOf("OK") < 0) return false;
+  String netopen = sim7600_at("AT+NETOPEN", 4000, true);
+  if (netopen.indexOf("OK") < 0 && netopen.indexOf("Network is already opened") < 0) return false;
+
+  // Start MQTT stack and connect
+  cmqtt_send("AT+CMQTTSTART", 5000, true); // OK or ALREADY START
+  
+  // Configure TLS if requested
+  if (use_tls) {
+    Serial.println("SIM7600: Configuring TLS for MQTT...");
+    
+    // Set SSL context (context 1)
+    if (!cmqtt_send("AT+CSSLCFG=\"sslversion\",1,3", 2000, true)) {
+      Serial.println("SIM7600: Failed to set SSL version");
+      return false;
+    }
+    
+    // Set cipher suite for AWS IoT compatibility
+    if (!cmqtt_send("AT+CSSLCFG=\"ciphersuite\",1,0xFFFF", 2000, true)) {
+      Serial.println("SIM7600: Failed to set cipher suite");
+      return false;
+    }
+    
+    // Enable certificate verification
+    if (!cmqtt_send("AT+CSSLCFG=\"authmode\",1,2", 2000, true)) {
+      Serial.println("SIM7600: Failed to set auth mode");
+      return false;
+    }
+    
+    // Configure the MQTT client to use SSL context 1
+    if (!cmqtt_send("AT+CMQTTSSL=0,1,1", 2000, true)) {
+      Serial.println("SIM7600: Failed to enable SSL for MQTT client");
+      return false;
+    }
+  }
+  
+  // Create a client index 0 with desired clientId, clean session=1
+  {
+    char cmd[256]; snprintf(cmd, sizeof(cmd), "AT+CMQTTACCQ=0,\"%s\",1", clientId);
+    if (!cmqtt_send(cmd, 1500, true)) return false;
+  }
+  // Optional credentials must be set before CONNECT on some firmwares
+  if (user && user[0]) {
+    char cmd[300]; snprintf(cmd, sizeof(cmd), "AT+CMQTTUSERCFG=0,1,\"%s\",\"%s\",\"\",0,0,\"\"", user, (pass && pass[0]) ? pass : "");
+    if (!cmqtt_send(cmd, 2000, true)) return false;
+  }
+  // Build URL: tcp://host:port or ssl://host:port
+  char url[160]; 
+  if (use_tls) {
+    snprintf(url, sizeof(url), "ssl://%s:%u", host, (unsigned)port);
+  } else {
+    snprintf(url, sizeof(url), "tcp://%s:%u", host, (unsigned)port);
+  }
+  
+  {
+    char cmd[240]; snprintf(cmd, sizeof(cmd), "AT+CMQTTCONNECT=0,\"%s\",%u,1", // keepalive, clean_session=1
+      url, (unsigned)keepalive_sec);
+    if (!cmqtt_send(cmd, 15000, true)) { // Longer timeout for TLS handshake
+      s_mqtt_connected = false; 
+      Serial.println("SIM7600: MQTT connect failed");
+      return false; 
+    }
+  }
+  s_mqtt_connected = true;
+  Serial.println("SIM7600: MQTT session established successfully");
+  return true;
+}
+
+bool sim7600_mqtt_session_publish(const char* topic, const char* payload, bool retained) {
+  if (!s_mqtt_connected || !topic || !payload) return false;
+  // Topic
+  {
+    char cmd[220]; snprintf(cmd, sizeof(cmd), "AT+CMQTTTOPIC=0,%u", (unsigned)strlen(topic));
+    if (!cmqtt_send(cmd, 1000, true)) return false;
+    // Send topic content
+    while (Serial1.available()) Serial1.read();
+    Serial1.write((const uint8_t*)topic, strlen(topic));
+    Serial1.flush();
+    delay(50);
+  }
+  // Payload
+  {
+    char cmd[220]; snprintf(cmd, sizeof(cmd), "AT+CMQTTPAYLOAD=0,%u", (unsigned)strlen(payload));
+    if (!cmqtt_send(cmd, 1000, true)) return false;
+    while (Serial1.available()) Serial1.read();
+    Serial1.write((const uint8_t*)payload, strlen(payload));
+    Serial1.flush();
+    delay(50);
+  }
+  // Publish QoS0
+  {
+    char cmd[64]; snprintf(cmd, sizeof(cmd), "AT+CMQTTPUB=0,%d,60", retained ? 1 : 0);
+    if (!cmqtt_send(cmd, 4000, true)) return false;
+  }
+  return true;
+}
+
+bool sim7600_mqtt_session_connected() { return s_mqtt_connected; }
+
+void sim7600_mqtt_session_end() {
+  if (!s_mqtt_connected) {
+    cmqtt_send("AT+CMQTTSTOP", 3000, true);
+    return;
+  }
+  cmqtt_send("AT+CMQTTDISC=0,60", 3000, true);
+  cmqtt_send("AT+CMQTTREL=0", 1500, true);
+  cmqtt_send("AT+CMQTTSTOP", 3000, true);
+  s_mqtt_connected = false;
 }
 
 bool sim7600_sync_time_via_ntp(const char* ntp1, const char* ntp2) {
@@ -363,13 +520,19 @@ static bool parse_cgnsinf(const String& line, float* plat, float* plon) {
 
 bool sim7600_gps_on() {
   // Usa o comando simples que funcionou no seu teste
-  String r = sim7600_at("AT+CGPS=1", 1200, false);
+  String r = sim7600_at("AT+CGPS=1", 1500, true);
   if (r.indexOf("OK") < 0) {
     // Tenta modo (1,1) se necessário
-    r = sim7600_at("AT+CGPS=1,1", 1500, false);
+    r = sim7600_at("AT+CGPS=1,1", 1800, true);
+  }
+  // Se ainda falhar, tenta pilha GNSS unificada
+  if (r.indexOf("OK") < 0) {
+    r = sim7600_at("AT+CGNSPWR=1", 1500, true);
   }
   delay(200);
   sim7600_at("AT+CGPS?", 800, false);
+  // Aguarda um pouco para o subsistema GNSS iniciar
+  delay(500);
   return true; // não força OK; segue a mesma estratégia do teste simples
 }
 
@@ -379,8 +542,8 @@ bool sim7600_gps_off() {
 }
 
 bool sim7600_gps_get_fix(float* lat, float* lon) {
-  // Estratégia do seu teste: enviar e ler cru por ~2s
-  String r = sim7600_at("AT+CGPSINFO", 2000, false);
+  // Estratégia do seu teste: enviar e ler cru por ~2.5s para capturar a linha completa
+  String r = sim7600_at("AT+CGPSINFO", 2500, false);
   if (!parse_cgpsinfo(r, lat, lon)) {
     delay(500);
     r = sim7600_at("AT+CGPSINFO", 2000, false);
@@ -392,20 +555,129 @@ bool sim7600_gps_get_fix(float* lat, float* lon) {
 }
 
 bool sim7600_gps_status(char* buffer, size_t len) {
-  String r = sim7600_at("AT+CGPSSTATUS?", 1500, false);
-  int p = r.indexOf("+CGPSSTATUS:");
+  // Primeiro, tenta o status via CGPSSTATUS (pilha CGPS)
+  String r = sim7600_at("AT+CGPSSTATUS?", 2500, true);
   bool fixed = false;
-  if (p >= 0) {
-    String s = r.substring(p + 12);
+
+  // Prefer the last occurrence in case of echoed lines
+  int p = r.lastIndexOf("+CGPSSTATUS:");
+  String s;
+  if (p >= 0 && r.indexOf("ERROR") < 0) {
+    s = r.substring(p + 12);
+    int nl = s.indexOf('\n');
+    int cr = s.indexOf('\r');
+    int cut = (nl < 0) ? cr : ((cr < 0) ? nl : (nl < cr ? nl : cr));
+    if (cut >= 0) s = s.substring(0, cut);
     s.trim();
-    if (buffer && len) s.toCharArray(buffer, len);
     if (s.indexOf("2D Fix") >= 0 || s.indexOf("3D Fix") >= 0) fixed = true;
-  } else if (buffer && len) {
-    r.toCharArray(buffer, len);
+    if (buffer && len) s.toCharArray(buffer, len);
+    return fixed;
   }
-  return fixed;
+
+  // Fallback: usar pilha GNSS unificada (CGNS)
+  String pwr = sim7600_at("AT+CGNSPWR?", 1200, true);
+  int pwri = pwr.indexOf("+CGNSPWR:");
+  int gnssOn = 0;
+  if (pwri >= 0) {
+    String tail = pwr.substring(pwri + 9);
+    tail.trim();
+    gnssOn = tail.toInt();
+  }
+  String inf = sim7600_at("AT+CGNSINF", 2000, true);
+  int gi = inf.indexOf("+CGNSINF:");
+  int run = 0, fix = 0;
+  if (gi >= 0) {
+    String line = inf.substring(gi + 9);
+    line.trim();
+    // Extrai os dois primeiros campos: run status, fix status
+    int c1 = line.indexOf(',');
+    int c2 = (c1 >= 0) ? line.indexOf(',', c1+1) : -1;
+    if (c1 > 0) run = line.substring(0, c1).toInt();
+    if (c2 > c1) fix = line.substring(c1+1, c2).toInt();
+    // Monta string amigável
+    String ss = String("GNSSPWR=") + gnssOn + ", CGNSINF run=" + run + ", fix=" + fix;
+    if (buffer && len) ss.toCharArray(buffer, len);
+    return fix == 1;
+  }
+
+  // Se nada funcionou, devolve "ERROR"
+  if (buffer && len) strncpy(buffer, "ERROR", len);
+  return false;
 }
 
 void sim7600_gps_cold_reset() {
   sim7600_at("AT+CGPSRST=1", 1200, false);
+}
+
+// --- TLS Certificate management ---
+bool sim7600_tls_configure_certs(const char* ca_cert, const char* client_cert, const char* private_key) {
+  if (!ca_cert || !client_cert || !private_key) {
+    Serial.println("SIM7600: Invalid certificate parameters");
+    return false;
+  }
+  
+  Serial.println("SIM7600: Configuring TLS certificates...");
+  
+  // Clear any existing certificates first
+  sim7600_tls_clear_certs();
+  
+  // Configure CA certificate (context 1, CA cert)
+  if (!cmqtt_send("AT+CCERTDOWN=\"ca_cert.pem\",1", 3000, true)) {
+    Serial.println("SIM7600: Failed to start CA cert download");
+    return false;
+  }
+  
+  // Send CA certificate data
+  Serial1.print(ca_cert);
+  delay(500);
+  
+  // Configure client certificate
+  if (!cmqtt_send("AT+CCERTDOWN=\"client_cert.pem\",2", 3000, true)) {
+    Serial.println("SIM7600: Failed to start client cert download");
+    return false;
+  }
+  
+  // Send client certificate data
+  Serial1.print(client_cert);
+  delay(500);
+  
+  // Configure private key
+  if (!cmqtt_send("AT+CCERTDOWN=\"private_key.pem\",3", 3000, true)) {
+    Serial.println("SIM7600: Failed to start private key download");
+    return false;
+  }
+  
+  // Send private key data
+  Serial1.print(private_key);
+  delay(500);
+  
+  // Configure SSL context to use the certificates
+  if (!cmqtt_send("AT+CSSLCFG=\"cacert\",1,\"ca_cert.pem\"", 2000, true)) {
+    Serial.println("SIM7600: Failed to set CA cert");
+    return false;
+  }
+  
+  if (!cmqtt_send("AT+CSSLCFG=\"clientcert\",1,\"client_cert.pem\"", 2000, true)) {
+    Serial.println("SIM7600: Failed to set client cert");
+    return false;
+  }
+  
+  if (!cmqtt_send("AT+CSSLCFG=\"clientkey\",1,\"private_key.pem\"", 2000, true)) {
+    Serial.println("SIM7600: Failed to set private key");
+    return false;
+  }
+  
+  Serial.println("SIM7600: TLS certificates configured successfully");
+  return true;
+}
+
+bool sim7600_tls_clear_certs() {
+  Serial.println("SIM7600: Clearing TLS certificates...");
+  
+  // Clear certificates (ignore errors as they might not exist)
+  cmqtt_send("AT+CCERTDELE=\"ca_cert.pem\"", 1000, false);
+  cmqtt_send("AT+CCERTDELE=\"client_cert.pem\"", 1000, false);
+  cmqtt_send("AT+CCERTDELE=\"private_key.pem\"", 1000, false);
+  
+  return true;
 }

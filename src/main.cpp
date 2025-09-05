@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "wifi_manager.h"
 #include "mqtt_client.h"
+#include "aws_iot_config.h"
 
 // ---------- Config (ajuste conforme necessário) ----------
 const char* DEVICE_NAME = "PW_EMBARCADO_ARDUINO";
@@ -24,14 +25,15 @@ static char DEVICE_ID[32] = {0};
 // - Para um serviço público, use o host, ex.: "test.mosquitto.org"
 // - Porta padrão usada é 1883 (configurada em mqtt_client.cpp)
 // - Se o broker exigir autenticação, preencha MQTT_USER e MQTT_PASS. Caso contrário, deixe como "".
-const char* MQTT_BROKER = "192.168.47.64:1883"; // altere para o IP/host do seu broker
-const char* MQTT_USER   = "";             // ex.: "meuUsuario" (ou deixe vazio)
-const char* MQTT_PASS   = "";             // ex.: "minhaSenha" (ou deixe vazio)
+// Para AWS IoT, defina o endpoint em include/aws_iot_config.h (AWS_IOT_ENDPOINT) e o clientId (AWS_IOT_CLIENT_ID)
+const char* MQTT_BROKER = AWS_IOT_ENDPOINT; // ex.: "xxxxx-ats.iot.sa-east-1.amazonaws.com"
+const char* MQTT_USER   = "";             // AWS IoT não usa user/pass; deixar vazio
+const char* MQTT_PASS   = "";
 
 // Intervalos de envio (ajuste aqui)
 const uint32_t WIFI_PUBLISH_INTERVAL_MS     = 2000;  // Wi‑Fi/MQTT: 2s por padrão
-const uint32_t CELLULAR_PUBLISH_INTERVAL_MS = 30000; // Celular (SIM7600): 30s por padrão
-const uint32_t GPS_UPDATE_INTERVAL_MS       = 20000; // Atualiza GPS a cada 10s para não travar o loop
+const uint32_t CELLULAR_PUBLISH_INTERVAL_MS = 10000; // Celular (SIM7600): 2s por padrão com sessão persistente
+const uint32_t GPS_UPDATE_INTERVAL_MS       = 5000; // Atualiza GPS a cada 5s (mais responsivo)
 const uint32_t SAVE_TOTAL_INTERVAL_MS       = 60000; // Salva total no flash a cada 30s para evitar desgaste
 
 // Pins
@@ -71,6 +73,10 @@ static uint32_t lastNtpAttemptMs = 0;
 static uint32_t lastCellularPublishMs = 0;
 static uint32_t lastGpsUpdateMs = 0;
 static uint32_t lastTotalSaveMs = 0;
+static bool cellMqttSessionUp = false;
+static char lastGpsCached[64] = "0.000000,0.000000";
+// Mutex to serialize access to SIM7600 AT interface (Serial1)
+static SemaphoreHandle_t sim7600_mutex = NULL;
 // constrói DEVICE_ID em setup
 static void build_device_id() {
   if (USE_FIXED_DEVICE_ID && FIXED_DEVICE_ID && FIXED_DEVICE_ID[0] != '\0') {
@@ -88,6 +94,8 @@ static void build_device_id() {
 
 // ---------- forward
 void update_led(float flow_Lday);
+void gpsTask(void* pv);
+void serviceTask(void* pv);
 
 void update_led(float flow_Lday) {
   int64_t now = esp_timer_get_time();
@@ -176,28 +184,25 @@ void monitorTask(void* pvParameters) {
     struct tm tm;
     localtime_r(&t, &tm);
 
+    // Use GPS em cache atualizado pela task de fundo
     char gpsbuf[64];
-    // Atualiza GPS apenas no intervalo configurado para evitar bloqueios longos (~6s)
-    static char lastGpsCached[64] = "0.000000,0.000000";
-    if (millis() - lastGpsUpdateMs >= GPS_UPDATE_INTERVAL_MS) {
-      gps_get_position(lastGpsCached, sizeof(lastGpsCached));
-      lastGpsUpdateMs = millis();
-    }
+    portENTER_CRITICAL(&mux);
     strncpy(gpsbuf, lastGpsCached, sizeof(gpsbuf)-1);
+    portEXIT_CRITICAL(&mux);
     gpsbuf[sizeof(gpsbuf)-1] = '\0';
 
-    // tenta sincronizar hora via NTP: primeiro por Wi‑Fi; se não, tenta via SIM7600
+    // Sincroniza hora via NTP (Wi‑Fi) ou CNTP (SIM7600)
     if (!timeSynced) {
       time_t nowCheck = time(NULL);
       if (nowCheck < 1609459200) { // 2021-01-01
         if (millis() - lastNtpAttemptMs > 5000) {
           lastNtpAttemptMs = millis();
           if (wifi_manager_connected()) {
-            // POSIX TZ for Brazil UTC-3 (no DST). Use "<-03>3" to avoid DST rules.
             configTzTime("<-03>3", "pool.ntp.org", "time.google.com");
           } else {
-            // Tenta CNTP via SIM7600
+            if (sim7600_mutex) xSemaphoreTake(sim7600_mutex, portMAX_DELAY);
             sim7600_sync_time_via_ntp();
+            if (sim7600_mutex) xSemaphoreGive(sim7600_mutex);
           }
         }
       } else {
@@ -205,12 +210,10 @@ void monitorTask(void* pvParameters) {
       }
     }
 
-    // publica e imprime a cada 2s
-  if (millis() - lastPublishMs >= WIFI_PUBLISH_INTERVAL_MS) {
+    // Publica periodicamente
+    if (millis() - lastPublishMs >= WIFI_PUBLISH_INTERVAL_MS) {
       lastPublishMs = millis();
-      // JSON compacto: chaves curtas para economizar dados
-      // {"id":"dev001","ts":"2025-08-31 12:34:56","l":10.362,"f":1234.56,"g":"-23.5,-46.6"}
-      char payload[192];
+      char payload[160];
       snprintf(payload, sizeof(payload),
         "{\"id\":\"%s\",\"ts\":\"%04d-%02d-%02d %02d:%02d:%02d\",\"l\":%.3f,\"f\":%.2f,\"g\":\"%s\"}",
         DEVICE_ID,
@@ -219,20 +222,17 @@ void monitorTask(void* pvParameters) {
         totalLiters, flow_Lday, gpsbuf);
 
       Serial.println(payload);
-  // Tópicos por dispositivo
       String topicHid = String(DEVICE_ID) + "/sensor/hidrometro";
       String topicGps = String(DEVICE_ID) + "/coordenadas/gps";
 
-      // Prefer WiFi+MQTT quando broker definido aqui; senão fallback SIM7600
       if (wifi_manager_connected() && MQTT_BROKER[0] != '\0') {
         if (!mqttInitDone) {
           const char* useUser = (MQTT_USER[0] != '\0') ? MQTT_USER : nullptr;
           const char* usePass = (MQTT_PASS[0] != '\0') ? MQTT_PASS : nullptr;
-          mqtt_client_init(MQTT_BROKER, useUser, usePass);
+          mqtt_client_init(MQTT_BROKER, AWS_IOT_CLIENT_ID, useUser, usePass);
           mqttInitDone = true;
         }
         if (mqtt_client_connected()) {
-          // mensagem principal retained (estado atual), GPS só quando mudar
           static char lastGps[64] = "";
           mqtt_client_publish(topicHid.c_str(), payload, true);
           if (strcmp(lastGps, gpsbuf) != 0) {
@@ -240,43 +240,114 @@ void monitorTask(void* pvParameters) {
             strncpy(lastGps, gpsbuf, sizeof(lastGps)-1);
           }
         } else {
-          // Fallback celular mesmo com Wi‑Fi: respeita intervalo
-          uint32_t nowMs = millis();
-          if (nowMs - lastCellularPublishMs >= CELLULAR_PUBLISH_INTERVAL_MS) {
-            lastCellularPublishMs = nowMs;
-            sim7600_send(topicHid.c_str(), payload);
-            // via celular, economiza: só envia GPS quando mudar
-            static char lastGpsCell[64] = "";
-            if (strcmp(lastGpsCell, gpsbuf) != 0) {
-              sim7600_send(topicGps.c_str(), gpsbuf);
-              strncpy(lastGpsCell, gpsbuf, sizeof(lastGpsCell)-1);
+          bool isAws = strstr(MQTT_BROKER, "amazonaws.com") != nullptr || strstr(MQTT_BROKER, "-ats.iot") != nullptr;
+          if (isAws) {
+            Serial.println("Skipping cellular fallback: AWS IoT requires TLS");
+          } else {
+            uint32_t nowMs = millis();
+            if (nowMs - lastCellularPublishMs >= CELLULAR_PUBLISH_INTERVAL_MS) {
+              lastCellularPublishMs = nowMs;
+              const char* brokerStr = MQTT_BROKER;
+              const char* colon = strchr(brokerStr, ':');
+              unsigned short port = 1883; char host[96] = {0};
+              if (colon) { size_t hlen = (size_t)(colon - brokerStr); if (hlen >= sizeof(host)) hlen = sizeof(host)-1; memcpy(host, brokerStr, hlen); port = (uint16_t)atoi(colon+1);} else { strncpy(host, brokerStr, sizeof(host)-1);}            
+              if (sim7600_mutex) xSemaphoreTake(sim7600_mutex, portMAX_DELAY);
+              if (!cellMqttSessionUp) {
+                cellMqttSessionUp = sim7600_mqtt_session_begin(colon?host:brokerStr, port, DEVICE_ID, (MQTT_USER[0]?MQTT_USER:nullptr), (MQTT_PASS[0]?MQTT_PASS:nullptr), 60, false);
+              }
+              if (cellMqttSessionUp) {
+                sim7600_mqtt_session_publish(topicHid.c_str(), payload, true);
+              }
+              if (sim7600_mutex) xSemaphoreGive(sim7600_mutex);
+              static char lastGpsCell[64] = "";
+              if (strcmp(lastGpsCell, gpsbuf) != 0) {
+                if (sim7600_mutex) xSemaphoreTake(sim7600_mutex, portMAX_DELAY);
+                if (cellMqttSessionUp) sim7600_mqtt_session_publish(topicGps.c_str(), gpsbuf, false);
+                if (sim7600_mutex) xSemaphoreGive(sim7600_mutex);
+                strncpy(lastGpsCell, gpsbuf, sizeof(lastGpsCell)-1);
+              }
             }
           }
         }
       } else {
-        // Sem Wi‑Fi: envia via celular como MQTT real no intervalo configurado
-        uint32_t nowMs = millis();
-        if (nowMs - lastCellularPublishMs >= CELLULAR_PUBLISH_INTERVAL_MS) {
-          lastCellularPublishMs = nowMs;
-          // Parse host:port se fornecido
-          const char* brokerStr = MQTT_BROKER;
-          const char* colon = strchr(brokerStr, ':');
-          unsigned short port = 1883; char host[96] = {0};
-          if (colon) {
-            size_t hlen = (size_t)(colon - brokerStr); if (hlen >= sizeof(host)) hlen = sizeof(host)-1;
-            memcpy(host, brokerStr, hlen); port = (uint16_t)atoi(colon+1);
-          } else {
-            strncpy(host, brokerStr, sizeof(host)-1);
+        bool isAws = strstr(MQTT_BROKER, "amazonaws.com") != nullptr || strstr(MQTT_BROKER, "-ats.iot") != nullptr;
+        if (isAws) {
+          uint32_t nowMs = millis();
+          if (nowMs - lastCellularPublishMs >= CELLULAR_PUBLISH_INTERVAL_MS) {
+            lastCellularPublishMs = nowMs;
+            static bool tls_configured = false;
+            if (!tls_configured) {
+              Serial.println("SIM7600: Configuring AWS IoT certificates for cellular...");
+              #include "aws_iot_config.h"
+              if (sim7600_mutex) xSemaphoreTake(sim7600_mutex, portMAX_DELAY);
+              bool tls_ok = sim7600_tls_configure_certs(AWS_CERT_CA, AWS_CERT_CRT, AWS_CERT_PRIVATE);
+              if (sim7600_mutex) xSemaphoreGive(sim7600_mutex);
+              if (tls_ok) {
+                tls_configured = true;
+                Serial.println("SIM7600: TLS certificates configured");
+              }
+            }
+            if (sim7600_mutex) xSemaphoreTake(sim7600_mutex, portMAX_DELAY);
+            if (tls_configured && !cellMqttSessionUp) {
+              cellMqttSessionUp = sim7600_mqtt_session_begin(MQTT_BROKER, 8883, AWS_IOT_CLIENT_ID, nullptr, nullptr, 60, true);
+            }
+            if (cellMqttSessionUp) {
+              sim7600_mqtt_session_publish(topicHid.c_str(), payload, true);
+            }
+            if (sim7600_mutex) xSemaphoreGive(sim7600_mutex);
+            static char lastGpsNoWifi[64] = "";
+            if (strcmp(lastGpsNoWifi, gpsbuf) != 0) {
+              if (sim7600_mutex) xSemaphoreTake(sim7600_mutex, portMAX_DELAY);
+              if (cellMqttSessionUp) sim7600_mqtt_session_publish(topicGps.c_str(), gpsbuf, false);
+              if (sim7600_mutex) xSemaphoreGive(sim7600_mutex);
+              strncpy(lastGpsNoWifi, gpsbuf, sizeof(lastGpsNoWifi)-1);
+            }
           }
-          sim7600_mqtt_publish(colon?host:brokerStr, port, (MQTT_USER[0]?MQTT_USER:nullptr), (MQTT_PASS[0]?MQTT_PASS:nullptr), DEVICE_ID, topicHid.c_str(), payload, true);
-          static char lastGpsNoWifi[64] = "";
-          if (strcmp(lastGpsNoWifi, gpsbuf) != 0) {
-            sim7600_mqtt_publish(colon?host:brokerStr, port, (MQTT_USER[0]?MQTT_USER:nullptr), (MQTT_PASS[0]?MQTT_PASS:nullptr), DEVICE_ID, topicGps.c_str(), gpsbuf, false);
-            strncpy(lastGpsNoWifi, gpsbuf, sizeof(lastGpsNoWifi)-1);
+        } else {
+          uint32_t nowMs = millis();
+          if (nowMs - lastCellularPublishMs >= CELLULAR_PUBLISH_INTERVAL_MS) {
+            lastCellularPublishMs = nowMs;
+            const char* brokerStr = MQTT_BROKER;
+            const char* colon = strchr(brokerStr, ':');
+            unsigned short port = 1883; char host[96] = {0};
+            if (colon) { size_t hlen = (size_t)(colon - brokerStr); if (hlen >= sizeof(host)) hlen = sizeof(host)-1; memcpy(host, brokerStr, hlen); port = (uint16_t)atoi(colon+1);} else { strncpy(host, brokerStr, sizeof(host)-1);}          
+            if (sim7600_mutex) xSemaphoreTake(sim7600_mutex, portMAX_DELAY);
+            if (!cellMqttSessionUp) {
+              cellMqttSessionUp = sim7600_mqtt_session_begin(colon?host:brokerStr, port, DEVICE_ID, (MQTT_USER[0]?MQTT_USER:nullptr), (MQTT_PASS[0]?MQTT_PASS:nullptr), 60, false);
+            }
+            if (cellMqttSessionUp) {
+              sim7600_mqtt_session_publish(topicHid.c_str(), payload, true);
+            }
+            if (sim7600_mutex) xSemaphoreGive(sim7600_mutex);
+            static char lastGpsNoWifi[64] = "";
+            if (strcmp(lastGpsNoWifi, gpsbuf) != 0) {
+              if (sim7600_mutex) xSemaphoreTake(sim7600_mutex, portMAX_DELAY);
+              if (cellMqttSessionUp) sim7600_mqtt_session_publish(topicGps.c_str(), gpsbuf, false);
+              if (sim7600_mutex) xSemaphoreGive(sim7600_mutex);
+              strncpy(lastGpsNoWifi, gpsbuf, sizeof(lastGpsNoWifi)-1);
+            }
           }
         }
       }
     }
+  }
+}
+
+// --- GPS background task: queries SIM7600 periodically without blocking monitorTask ---
+void gpsTask(void* pv) {
+  (void) pv;
+  for (;;) {
+    // Wait interval between polls
+    vTaskDelay(pdMS_TO_TICKS(GPS_UPDATE_INTERVAL_MS));
+    if (sim7600_mutex) xSemaphoreTake(sim7600_mutex, portMAX_DELAY);
+    char buf[64] = {0};
+    // Non-blocking relative to monitorTask: this runs in its own task
+    gps_get_position(buf, sizeof(buf));
+    portENTER_CRITICAL(&mux);
+    strncpy(lastGpsCached, buf, sizeof(lastGpsCached)-1);
+    lastGpsCached[sizeof(lastGpsCached)-1] = '\0';
+    portEXIT_CRITICAL(&mux);
+    if (sim7600_mutex) xSemaphoreGive(sim7600_mutex);
   }
 }
 
@@ -308,9 +379,13 @@ void setup() {
 
   buzzer_init(BUZZER_PIN, LEDC_CHANNEL, LEDC_FREQ_HZ, LEDC_RESOLUTION);
   flow_sensor_init(FLOW_SENSOR_PIN, PULSES_PER_LITER, &mux);
-  // Configure SIM7600 pins and init
+    // Create mutex for SIM7600 AT access and start GPS task
+    sim7600_mutex = xSemaphoreCreateMutex();
+
   sim7600_config_pins(SIM7600_RX_PIN, SIM7600_TX_PIN, SIM7600_PWRKEY_PIN, SIM7600_STATUS_PIN);
   sim7600_init();
+    // Start GPS background task (after SIM7600 initialized)
+    xTaskCreatePinnedToCore(gpsTask, "gpsTask", 4096, NULL, 1, NULL, 1);
   // Importante: ligar o GPS somente após Serial1 estar configurada pelo sim7600_init()
   gps_init();
   // Start Wi-Fi manager (tries STA connection, or starts SoftAP provisioning)
@@ -325,9 +400,9 @@ void setup() {
   xTaskCreatePinnedToCore(
     monitorTask,
     "monitorTask",
-    4096,
+  12288,
     NULL,
-    1,
+  2,
     NULL,
     1
   );
@@ -336,7 +411,7 @@ void setup() {
   xTaskCreatePinnedToCore(
     serviceTask,
     "serviceTask",
-    4096,
+  6144,
     NULL,
     1,
     NULL,

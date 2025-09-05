@@ -157,10 +157,24 @@ void wifi_manager_init() {
   }
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("Connected to WiFi");
-  // Sync time for proper timestamps
-  // POSIX TZ for Brazil UTC-3 (no DST). Note: POSIX sign is inverted.
-  // "<-03>" is the display name; offset 3 means UTC-3.
-  configTzTime("<-03>3", "pool.ntp.org", "time.google.com");
+    // Sync time for proper timestamps with multiple servers
+    // POSIX TZ for Brazil UTC-3 (no DST). Note: POSIX sign is inverted.
+    // "<-03>" is the display name; offset 3 means UTC-3.
+    Serial.println("Syncing time with NTP servers...");
+    configTzTime("<-03>3", "pool.ntp.org", "time.google.com", "a.ntp.br");
+    
+    // Wait a bit for time sync and log the result
+    delay(2000);
+    time_t now = time(nullptr);
+    if (now > 1609459200) { // 2021-01-01
+      struct tm timeinfo;
+      localtime_r(&now, &timeinfo);
+      Serial.printf("Time synced successfully: %04d-%02d-%02d %02d:%02d:%02d\n", 
+                    timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                    timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    } else {
+      Serial.println("Time sync may have failed, will retry later");
+    }
   } else {
   Serial.println("WiFi: STA connection failed; AP permanece ativo para portal por 2 minutos");
   }
